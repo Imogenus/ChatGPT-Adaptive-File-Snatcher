@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Adaptive File Snatcher
 // @namespace    http://tampermonkey.net/
-// @version      4.7.3
-// @description  v4.7.2 behavior with stable GitHub-hosted Tampermonkey updates.
+// @version      4.7.4
+// @description  Learn workspace paths independently of artifact detection; preserve v4.7.3 downloads.
 // @updateURL    https://raw.githubusercontent.com/Imogenus/ChatGPT-Adaptive-File-Snatcher/main/ChatGPT_Adaptive_File_Snatcher.user.js
 // @downloadURL  https://raw.githubusercontent.com/Imogenus/ChatGPT-Adaptive-File-Snatcher/main/ChatGPT_Adaptive_File_Snatcher.user.js
 // @match        https://chatgpt.com/*
@@ -14,7 +14,7 @@
 (() => {
 'use strict';
 
-const V='4.7.3', LOG='[AdaptiveSnatcher]', WID='batch-snatcher-widget';
+const V='4.7.4', LOG='[AdaptiveSnatcher]', WID='batch-snatcher-widget';
 const EXT=new Set(['zip','py','md','txt','json','png','jpg','jpeg','webp','gif','svg','pdf','blend','csv','tsv','html','htm','js','jsx','ts','tsx','css','xml','yaml','yml','toml','ini','cfg','log','doc','docx','xls','xlsx','ppt','pptx','mp4','webm','mov','avi','wav','mp3','ogg','flac','glb','gltf','obj','fbx','stl']);
 const INSTANCE='__CHATGPT_ADAPTIVE_SNATCHER__';
 if(window[INSTANCE]===V)return;
@@ -33,7 +33,8 @@ let latest=null, panelPinned=false, scanDelay=null, status='idle';
 const seenUsers=new Set(),seenAssistants=new Set(),freshAssistants=new Set();
 let initialized=false,pendingUserId='',pendingUserRoot=null;
 // Calibration is per conversation, deliberately separate from download counts.
-// A response provides only a candidate; the backend must verify it before use.
+// Calibration learns a path independently of artifact detection. A successful
+// direct download later upgrades that path from learned to verified.
 const calibrationKey=`${key}_workspace_calibration_v47`;
 let calibration={directory:'',verified:false,pending:false,baselineIds:[]};
 try{calibration={...calibration,...JSON.parse(localStorage.getItem(calibrationKey)||'{}')}}catch(_){}
@@ -294,7 +295,7 @@ function sandboxPath(el,filename){
       if(m){try{return decodeURIComponent(m[1])}catch(_){return m[1]}}
     }
   }
-  return filename?(calibration.verified&&calibration.directory?`${calibration.directory}${filename}`:`/mnt/data/${filename}`):'';
+  return filename?(calibration.directory?`${calibration.directory}${filename}`:`/mnt/data/${filename}`):'';
 }
 
 function calibrationPath(text){
@@ -319,15 +320,10 @@ async function pollCalibration(){
     if(!path)continue;
     calibrationBusy=true;
     try{
-      const c=findCalibrationCandidate(path);
-      if(!c)throw Error('latest ZIP link not found in assistant turns; no path stored');
-      // This GET validates path + original assistant message ID without fetching
-      // the ZIP or changing capture eligibility, dedupe, or iteration counters.
-      const exact={...c,sandboxPath:path};
-      await signedUrl(exact,await token());
-      calibration={directory:path.slice(0,path.lastIndexOf('/')+1),verified:true,pending:false,baselineIds:[]};
-      saveCalibration();record('calibration-verified',{directory:calibration.directory,file:c.filename,messageId:c.messageId});
-      setStatus('calibrated ✓ (backend verified)');refresh();
+      const directory=path.slice(0,path.lastIndexOf('/')+1);
+      calibration={directory,verified:false,pending:false,baselineIds:[]};
+      saveCalibration();record('calibration-learned',{directory,file:path.split('/').pop()});
+      setStatus('workspace learned; awaiting successful direct download');refresh();
     }catch(e){
       calibration.pending=false;calibration.verified=false;saveCalibration();
       record('calibration-failed',{reason:String(e.message||e)});setStatus(`calibration failed: ${e.message||e}`);refresh();
@@ -479,7 +475,7 @@ function setStatus(s){status=s;if(ui.status)ui.status.textContent=s;if(ui.icon)u
 function refresh(){
   if(!ui.icon)return;ui.icon.style.background=state.enabled?'#4CAF50':'#F44336';ui.icon.style.boxShadow=state.enabled?'0 0 12px #4CAF50':'0 4px 12px rgba(0,0,0,.35)';
   ui.count.textContent=state.infinite?`Downloaded: ${state.downloaded}/∞`:`Downloaded: ${state.downloaded}/${state.target}`;ui.input.value=state.target;ui.input.disabled=state.infinite;ui.inf.style.background=state.infinite?'#2f7d32':'#444';ui.status.textContent=status;
-  if(ui.calibration)ui.calibration.textContent=calibration.pending?'🟡 Awaiting calibration reply':calibration.verified?'🟢 Workspace calibrated':'🟡 Workspace unverified';
+  if(ui.calibration)ui.calibration.textContent=calibration.pending?'🟡 Awaiting calibration reply':calibration.verified?'🟢 Workspace verified':calibration.directory?'🔵 Workspace learned (unverified)':'🟡 Workspace unknown';
 }
 
 async function handle(c,force=false){
@@ -495,11 +491,17 @@ async function handle(c,force=false){
     }else{
       for(const wait of [0,800,1800]){
         if(wait)await new Promise(r=>setTimeout(r,wait));
-        try{await direct(c);err=null;verified=true;route='direct';break}catch(e){err=e;record('direct-attempt-failed',{...diagnosticIdentity(c),reason:String(e.message||e),retryDelay:wait})}
+        try{
+          await direct(c);err=null;verified=true;route='direct';
+          if(calibration.directory&&c.sandboxPath.startsWith(calibration.directory)&&!calibration.verified){
+            calibration.verified=true;saveCalibration();record('calibration-verified',{directory:calibration.directory,file:c.filename});refresh();
+          }
+          break;
+        }catch(e){err=e;record('direct-attempt-failed',{...diagnosticIdentity(c),reason:String(e.message||e),retryDelay:wait})}
       }
       if(err){
-        if(calibration.verified&&c.sandboxPath.startsWith(calibration.directory)&&/interpreter\/download HTTP 404/.test(String(err))){
-          calibration.verified=false;saveCalibration();record('calibration-invalidated',{file:c.filename,reason:'path rejected HTTP 404'});refresh();
+        if(calibration.directory&&c.sandboxPath.startsWith(calibration.directory)&&/interpreter\/download HTTP 404/.test(String(err))){
+          calibration.verified=false;saveCalibration();record('calibration-unverified',{file:c.filename,reason:'path rejected HTTP 404'});refresh();
         }
         console.warn(LOG,'direct route failed, using native fallback:',String(err));
         record('native-fallback-start',{...diagnosticIdentity(c),cause:String(err.message||err)});await fallback(c)}
